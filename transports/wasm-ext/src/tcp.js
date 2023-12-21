@@ -15,6 +15,8 @@ const multiaddr_to_tcp_host_and_port = (addr) => {
         return {
             host: parsed[2],
             port: Number(parsed[3]),
+            family: 4, // ensure outgoing connections are made using IPv4 only
+            keepAlive: true // enable client-based TCP keep-alive
         };
     }
 
@@ -50,12 +52,12 @@ let to_connection = (socket, reader) => {
                             resolve();
                             return;
                         }
-                        
+
                         if (socket.readyState != 'open') {
                             reject("Socket is not open");
                             return;
                         }
-                        
+
                         setTimeout(check, 1);
                     }
 
@@ -100,7 +102,7 @@ const dial = (addr) => {
         })
 
         socket.on('data', (ev) => reader.inject_array_buffer(ev));
-        socket.connect(target, () => resolve(to_connection(socket, reader)))
+        socket.connect(target, () => resolve(to_connection(socket, reader)));
     });
 }
 
@@ -125,7 +127,7 @@ const listen_on = (addr) => {
             new_addrs: new_addreses,
             expired_addrs: exp_addrs,
             new_connections: new_conns,
-            // NOTE: after going thought the libp2p-wasm-ext source, this does not 
+            // NOTE: after going thought the libp2p-wasm-ext source, this does not
             // appear to be used anywhere, but instead the iterator is used to extract
             // the next ListenEvent
             next_event: Promise.resolve(),
@@ -141,18 +143,19 @@ const listen_on = (addr) => {
         })
         socket.on('close', (ev) => {
             reader.inject_eof();
-            
+
         })
 
         // We inject all incoming messages into the queue unconditionally. The caller isn't
         // supposed to access this queue unless the connection is open.
         socket.on('data', (ev) => reader.inject_array_buffer(ev));
-
-        return {
+        res = {
             connection: to_connection(socket, reader),
             observed_addr: tcp_host_family_port_to_multiaddr(socket.remoteAddress, socket.remotePort, socket.remoteFamily),
             local_addr: addr
         }
+        return res
+
     }
 
     // initiate the socket
