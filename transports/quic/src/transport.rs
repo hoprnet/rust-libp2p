@@ -192,6 +192,11 @@ impl<P: Provider> GenTransport<P> {
 
         socket.bind(&socket_addr.into())?;
 
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        if let Some(mark) = self.quinn_config.socket_mark {
+            socket.set_mark(mark)?;
+        }
+
         Ok(socket.into())
     }
 
@@ -204,7 +209,7 @@ impl<P: Provider> GenTransport<P> {
             SocketFamily::Ipv4 => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
             SocketFamily::Ipv6 => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
         };
-        let socket = UdpSocket::bind(listen_socket_addr)?;
+        let socket = self.create_socket(listen_socket_addr)?;
         let endpoint_config = self.quinn_config.endpoint_config.clone();
         let endpoint = Self::new_endpoint(endpoint_config, None, socket)?;
         Ok(endpoint)
