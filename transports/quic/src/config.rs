@@ -62,6 +62,12 @@ pub struct Config {
     #[deprecated(note = "QUIC draft versions are no longer supported")]
     pub support_draft_29: bool,
 
+    /// Optional socket mark to set on QUIC sockets.
+    ///
+    /// Available only on Android, Fuchsia, and Linux.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    pub socket_mark: Option<u32>,
+
     /// TLS client config for the inner [`quinn::ClientConfig`].
     client_tls_config: Arc<QuicClientConfig>,
     /// TLS server config for the inner [`quinn::ServerConfig`].
@@ -93,6 +99,8 @@ impl Config {
             max_concurrent_stream_limit: 256,
             keep_alive_interval: Duration::from_secs(5),
             max_connection_data: 15_000_000,
+            #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+            socket_mark: None,
 
             // Ensure that one stream is not consuming the whole connection.
             max_stream_data: 10_000_000,
@@ -122,6 +130,8 @@ pub(crate) struct QuinnConfig {
     pub(crate) client_config: quinn::ClientConfig,
     pub(crate) server_config: quinn::ServerConfig,
     pub(crate) endpoint_config: quinn::EndpointConfig,
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    pub(crate) socket_mark: Option<u32>,
 }
 
 #[expect(deprecated)]
@@ -139,6 +149,8 @@ impl From<Config> for QuinnConfig {
             handshake_timeout: _,
             keypair,
             mtu_discovery_config,
+            #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+            socket_mark
         } = config;
         let mut transport = quinn::TransportConfig::default();
         // Disable uni-directional streams.
@@ -180,6 +192,8 @@ impl From<Config> for QuinnConfig {
             client_config,
             server_config,
             endpoint_config,
+            #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+            socket_mark,
         }
     }
 }
