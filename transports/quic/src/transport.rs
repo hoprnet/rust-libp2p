@@ -49,7 +49,7 @@ use libp2p_identity::PeerId;
 use socket2::{Domain, Socket, Type};
 
 use crate::{
-    config::{Config, QuinnConfig},
+    config::{Config, QuinnConfig, SocketConfig},
     hole_punching::hole_puncher,
     provider::Provider,
     ConnectError, Connecting, Connection, Error,
@@ -80,6 +80,8 @@ pub struct GenTransport<P: Provider> {
     dialer: HashMap<SocketFamily, quinn::Endpoint>,
     /// Waker to poll the transport again when a new dialer or listener is added.
     waker: Option<Waker>,
+    /// Optional callback to customise UDP sockets before they are bound.
+    socket_config: Option<SocketConfig>,
     /// Holepunching attempts
     hole_punch_attempts: HashMap<SocketAddr, oneshot::Sender<Connecting>>,
 }
@@ -90,6 +92,7 @@ impl<P: Provider> GenTransport<P> {
     pub fn new(config: Config) -> Self {
         let handshake_timeout = config.handshake_timeout;
         let support_draft_29 = config.support_draft_29;
+        let socket_config = config.socket_config.clone();
         let quinn_config = config.into();
         Self {
             listeners: SelectAll::new(),
@@ -98,6 +101,7 @@ impl<P: Provider> GenTransport<P> {
             dialer: HashMap::new(),
             waker: None,
             support_draft_29,
+            socket_config,
             hole_punch_attempts: Default::default(),
         }
     }
@@ -190,6 +194,12 @@ impl<P: Provider> GenTransport<P> {
             socket.set_only_v6(true)?;
         }
 
+        // Run the caller-supplied hook before binding so that options such as `SO_MARK`
+        // take effect for this socket.
+        if let Some(socket_config) = &self.socket_config {
+            (socket_config.0)(&socket)?;
+        }
+
         socket.bind(&socket_addr.into())?;
 
         Ok(socket.into())
@@ -204,7 +214,9 @@ impl<P: Provider> GenTransport<P> {
             SocketFamily::Ipv4 => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
             SocketFamily::Ipv6 => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
         };
-        let socket = UdpSocket::bind(listen_socket_addr)?;
+        // Build the dialer socket through `create_socket` so the caller's socket hook
+        // (e.g. `SO_MARK`) is applied to outbound sockets as well as listeners.
+        let socket = self.create_socket(listen_socket_addr)?;
         let endpoint_config = self.quinn_config.endpoint_config.clone();
         let endpoint = Self::new_endpoint(endpoint_config, None, socket)?;
         Ok(endpoint)

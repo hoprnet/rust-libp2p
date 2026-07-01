@@ -85,6 +85,58 @@ async fn ipv4_dial_ipv6() {
     assert_eq!(b_connected, a_peer_id);
 }
 
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn socket_config_hook_runs_for_listener_and_dialer() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
+
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let make_transport = |counter: Arc<AtomicUsize>| {
+        let keypair = generate_tls_keypair();
+        let peer_id = keypair.public().to_peer_id();
+        let config = quic::Config::new(&keypair).with_socket_config(move |_socket| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let transport = quic::GenTransport::<quic::tokio::Provider>::new(config)
+            .map(|(p, c), _| (p, StreamMuxerBox::new(c)))
+            .boxed();
+        (peer_id, transport)
+    };
+
+    let (_, mut listener) = make_transport(counter.clone());
+    let (_, mut dialer) = make_transport(counter.clone());
+
+    let addr = start_listening(&mut listener, "/ip4/127.0.0.1/udp/0/quic-v1").await;
+    connect(&mut listener, &mut dialer, addr).await;
+
+    // The hook must have run at least once for the listener socket and once for the
+    // dialer socket (the refactored `bound_socket` path).
+    assert!(counter.load(Ordering::SeqCst) >= 2);
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn socket_config_hook_error_aborts_listen() {
+    let keypair = generate_tls_keypair();
+    let config = quic::Config::new(&keypair)
+        .with_socket_config(|_socket| Err(io::Error::other("socket config hook failed")));
+    let mut transport = quic::GenTransport::<quic::tokio::Provider>::new(config)
+        .map(|(p, c), _| (p, StreamMuxerBox::new(c)))
+        .boxed();
+
+    let result = transport.listen_on(
+        ListenerId::next(),
+        "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+    );
+    assert!(result.is_err());
+}
+
 /// Tests that a [`Transport::dial`] wakes up the task previously polling [`Transport::poll`].
 ///
 /// See https://github.com/libp2p/rust-libp2p/pull/3306 for context.

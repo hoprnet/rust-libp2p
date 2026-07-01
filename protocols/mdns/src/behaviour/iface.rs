@@ -123,12 +123,16 @@ where
         query_response_sender: mpsc::Sender<(PeerId, Multiaddr, Instant)>,
     ) -> io::Result<Self> {
         tracing::info!(address=%addr, "creating instance on iface address");
+        let socket_config = config.socket_config.clone();
         let recv_socket = match addr {
             IpAddr::V4(addr) => {
                 let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(socket2::Protocol::UDP))?;
                 socket.set_reuse_address(true)?;
                 #[cfg(unix)]
                 socket.set_reuse_port(true)?;
+                if let Some(socket_config) = &socket_config {
+                    (socket_config.0)(&socket)?;
+                }
                 socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5353).into())?;
                 socket.set_multicast_loop_v4(true)?;
                 socket.set_multicast_ttl_v4(255)?;
@@ -140,6 +144,9 @@ where
                 socket.set_reuse_address(true)?;
                 #[cfg(unix)]
                 socket.set_reuse_port(true)?;
+                if let Some(socket_config) = &socket_config {
+                    (socket_config.0)(&socket)?;
+                }
                 socket.bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 5353).into())?;
                 socket.set_multicast_loop_v6(true)?;
                 // TODO: find interface matching addr.
@@ -157,7 +164,20 @@ where
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
             }
         };
-        let send_socket = U::from_std(UdpSocket::bind(bind_addr)?)?;
+        // Build the send socket through `socket2` so the caller's socket hook (e.g.
+        // `SO_MARK`) is applied to outbound mDNS traffic as well.
+        let send_socket = {
+            let socket = Socket::new(
+                Domain::for_address(bind_addr),
+                Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )?;
+            if let Some(socket_config) = &socket_config {
+                (socket_config.0)(&socket)?;
+            }
+            socket.bind(&bind_addr.into())?;
+            U::from_std(UdpSocket::from(socket))?
+        };
 
         // randomize timer to prevent all converging and firing at the same time.
         let query_interval = {

@@ -48,6 +48,33 @@ async fn test_discovery_tokio_ipv6() {
 }
 
 #[tokio::test]
+async fn socket_config_hook_runs_tokio() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let config = {
+        let counter = counter.clone();
+        Config::default().with_socket_config(move |_socket| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    };
+
+    // Discovery can only succeed once the mDNS recv and send sockets have been created,
+    // which is exactly when the hook runs.
+    run_discovery_test(config).await;
+
+    assert!(counter.load(Ordering::SeqCst) > 0);
+}
+
+#[tokio::test]
 async fn test_expired_tokio() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())

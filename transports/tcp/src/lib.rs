@@ -32,7 +32,7 @@ mod provider;
 
 use std::{
     collections::{HashSet, VecDeque},
-    io,
+    fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
     pin::Pin,
     sync::{Arc, RwLock},
@@ -50,7 +50,23 @@ use libp2p_core::{
 #[cfg(feature = "tokio")]
 pub use provider::tokio;
 use provider::{Incoming, Provider};
+pub use socket2;
 use socket2::{Domain, Socket, Type};
+
+/// Callback applied to every socket this transport creates, allowing the caller to set
+/// arbitrary socket options (e.g. `SO_MARK`) before the socket is bound or connected.
+type SocketConfigFn = Arc<dyn Fn(&Socket) -> io::Result<()> + Send + Sync>;
+
+/// Wrapper around a [`SocketConfigFn`] so that [`Config`] keeps deriving [`Clone`] and
+/// [`Debug`].
+#[derive(Clone)]
+struct SocketConfig(SocketConfigFn);
+
+impl fmt::Debug for SocketConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SocketConfig(<fn>)")
+    }
+}
 
 /// The configuration for a TCP/IP transport capability for libp2p.
 #[derive(Clone, Debug)]
@@ -61,6 +77,8 @@ pub struct Config {
     nodelay: bool,
     /// Size of the listen backlog for listen sockets.
     backlog: u32,
+    /// Optional callback to customise sockets before they are bound/connected.
+    socket_config: Option<SocketConfig>,
 }
 
 type Port = u16;
@@ -138,6 +156,7 @@ impl Config {
             ttl: None,
             nodelay: true, // Disable Nagle's algorithm by default.
             backlog: 1024,
+            socket_config: None,
         }
     }
 
@@ -156,6 +175,32 @@ impl Config {
     /// Configures the listen backlog for new listen sockets.
     pub fn listen_backlog(mut self, backlog: u32) -> Self {
         self.backlog = backlog;
+        self
+    }
+
+    /// Registers a callback that is run against every socket this transport creates,
+    /// for both listeners and dialers, after libp2p's own options have been applied and
+    /// *before* the socket is bound or connected.
+    ///
+    /// This grants access to the underlying [`socket2::Socket`] so that arbitrary socket
+    /// options can be set. Returning an error aborts the corresponding listen or dial.
+    ///
+    /// A common use is tagging sockets with `SO_MARK` so that firewall rules can classify
+    /// or filter libp2p traffic via fwmark:
+    ///
+    /// ```no_run
+    /// # use libp2p_tcp as tcp;
+    /// let config = tcp::Config::default().with_socket_config(|socket| {
+    ///     #[cfg(target_os = "linux")]
+    ///     socket.set_mark(0x1234)?;
+    ///     Ok(())
+    /// });
+    /// ```
+    pub fn with_socket_config(
+        mut self,
+        f: impl Fn(&Socket) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.socket_config = Some(SocketConfig(Arc::new(f)));
         self
     }
 
@@ -207,6 +252,11 @@ impl Config {
         let _ = port_use; // silence the unused warning on non-unix platforms (i.e. Windows)
 
         socket.set_nonblocking(true)?;
+
+        // Run the caller-supplied hook last so it can also override the defaults set above.
+        if let Some(socket_config) = &self.socket_config {
+            (socket_config.0)(&socket)?;
+        }
 
         Ok(socket)
     }
@@ -820,6 +870,98 @@ mod tests {
 
         test("/ip4/127.0.0.1/tcp/0".parse().unwrap());
         test("/ip6/::1/tcp/0".parse().unwrap());
+    }
+
+    #[test]
+    fn socket_config_hook_runs_for_listener_and_dialer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        async fn listener<T: Provider>(
+            config: Config,
+            addr: Multiaddr,
+            mut ready_tx: mpsc::Sender<Multiaddr>,
+        ) {
+            let mut tcp = Transport::<T>::new(config).boxed();
+            tcp.listen_on(ListenerId::next(), addr).unwrap();
+            loop {
+                match tcp.select_next_some().await {
+                    TransportEvent::NewAddress { listen_addr, .. } => {
+                        ready_tx.send(listen_addr).await.unwrap();
+                    }
+                    TransportEvent::Incoming { upgrade, .. } => {
+                        upgrade.await.unwrap();
+                        return;
+                    }
+                    e => panic!("Unexpected transport event: {e:?}"),
+                }
+            }
+        }
+
+        async fn dialer<T: Provider>(config: Config, mut ready_rx: mpsc::Receiver<Multiaddr>) {
+            let addr = ready_rx.next().await.unwrap();
+            let mut tcp = Transport::<T>::new(config);
+            tcp.dial(
+                addr,
+                DialOpts {
+                    role: Endpoint::Dialer,
+                    port_use: PortUse::New,
+                },
+            )
+            .unwrap()
+            .await
+            .unwrap();
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let make_config = || {
+            let counter = counter.clone();
+            Config::default().with_socket_config(move |_socket| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        };
+
+        let (ready_tx, ready_rx) = mpsc::channel(1);
+        let listener = listener::<tokio::Tcp>(
+            make_config(),
+            "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            ready_tx,
+        );
+        let dialer = dialer::<tokio::Tcp>(make_config(), ready_rx);
+        let rt = ::tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let tasks = ::tokio::task::LocalSet::new();
+        let listener = tasks.spawn_local(listener);
+        tasks.block_on(&rt, dialer);
+        tasks.block_on(&rt, listener).unwrap();
+
+        // The hook must have run at least once for the listener socket and once for the
+        // dialer socket.
+        assert!(counter.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn socket_config_hook_error_aborts_listen_and_dial() {
+        fn boom() -> Config {
+            Config::default()
+                .with_socket_config(|_socket| Err(io::Error::other("socket config hook failed")))
+        }
+
+        let mut tcp = Transport::<tokio::Tcp>::new(boom());
+        let listen_result =
+            tcp.listen_on(ListenerId::next(), "/ip4/127.0.0.1/tcp/0".parse().unwrap());
+        assert!(matches!(listen_result, Err(TransportError::Other(_))));
+
+        let dial_result = tcp.dial(
+            "/ip4/127.0.0.1/tcp/12345".parse().unwrap(),
+            DialOpts {
+                role: Endpoint::Dialer,
+                port_use: PortUse::New,
+            },
+        );
+        assert!(matches!(dial_result, Err(TransportError::Other(_))));
     }
 
     #[test]

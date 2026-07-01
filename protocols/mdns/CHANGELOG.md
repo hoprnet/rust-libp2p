@@ -1,5 +1,10 @@
 ## 0.48.0
 
+- Add `Config::with_socket_config` to run a caller-supplied hook against every UDP socket
+  (both recv and send) before it is bound, e.g. to set `SO_MARK` for firewall/fwmark
+  classification. Re-export the `socket2` crate. Note: `Config` now has an additional
+  field, so constructing it with a full struct literal requires `..Default::default()`.
+
 - Remove `async_std` dependency [PR 5958](https://github.com/libp2p/rust-libp2p/pull/5958)
 
 <!-- Update to libp2p-swarm v0.47.0 -->

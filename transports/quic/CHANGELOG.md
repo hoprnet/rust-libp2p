@@ -1,5 +1,9 @@
 ## 0.13.0
 
+- Add `Config::with_socket_config` to run a caller-supplied hook against every UDP socket
+  before it is bound, e.g. to set `SO_MARK` for firewall/fwmark classification. The hook
+  applies to dialer sockets as well as listeners. Re-export the `socket2` crate.
+
 - Remove `async-std` support.
   See [PR 5954](https://github.com/libp2p/rust-libp2p/pull/5954)
 

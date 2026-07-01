@@ -18,12 +18,28 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use std::{sync::Arc, time::Duration};
+use std::{fmt, io, sync::Arc, time::Duration};
 
 use quinn::{
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     MtuDiscoveryConfig, VarInt,
 };
+use socket2::Socket;
+
+/// Callback applied to every UDP socket the transport creates, allowing the caller to set
+/// arbitrary socket options (e.g. `SO_MARK`) before the socket is bound.
+pub(crate) type SocketConfigFn = Arc<dyn Fn(&Socket) -> io::Result<()> + Send + Sync>;
+
+/// Wrapper around a [`SocketConfigFn`] so that [`Config`] keeps deriving [`Clone`] and the
+/// transport keeps deriving [`Debug`].
+#[derive(Clone)]
+pub(crate) struct SocketConfig(pub(crate) SocketConfigFn);
+
+impl fmt::Debug for SocketConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SocketConfig(<fn>)")
+    }
+}
 
 /// Config for the transport.
 #[derive(Clone)]
@@ -71,6 +87,9 @@ pub struct Config {
 
     /// Parameters governing MTU discovery. See [`MtuDiscoveryConfig`] for details.
     mtu_discovery_config: Option<MtuDiscoveryConfig>,
+
+    /// Optional callback to customise UDP sockets before they are bound.
+    pub(crate) socket_config: Option<SocketConfig>,
 }
 
 #[expect(deprecated)]
@@ -98,6 +117,7 @@ impl Config {
             max_stream_data: 10_000_000,
             keypair: keypair.clone(),
             mtu_discovery_config: Some(Default::default()),
+            socket_config: None,
         }
     }
 
@@ -112,6 +132,33 @@ impl Config {
     /// Disable MTU path discovery (it is enabled by default).
     pub fn disable_path_mtu_discovery(mut self) -> Self {
         self.mtu_discovery_config = None;
+        self
+    }
+
+    /// Registers a callback that is run against every UDP socket the transport creates,
+    /// for both listeners and dialers, *before* the socket is bound.
+    ///
+    /// This grants access to the underlying [`socket2::Socket`] so that arbitrary socket
+    /// options can be set. Returning an error aborts the corresponding listen or dial.
+    ///
+    /// A common use is tagging sockets with `SO_MARK` so that firewall rules can classify
+    /// or filter libp2p traffic via fwmark:
+    ///
+    /// ```no_run
+    /// # use libp2p_quic as quic;
+    /// # fn config(keypair: &libp2p_identity::Keypair) -> quic::Config {
+    /// quic::Config::new(keypair).with_socket_config(|socket| {
+    ///     #[cfg(target_os = "linux")]
+    ///     socket.set_mark(0x1234)?;
+    ///     Ok(())
+    /// })
+    /// # }
+    /// ```
+    pub fn with_socket_config(
+        mut self,
+        f: impl Fn(&Socket) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.socket_config = Some(SocketConfig(Arc::new(f)));
         self
     }
 }
@@ -139,6 +186,8 @@ impl From<Config> for QuinnConfig {
             handshake_timeout: _,
             keypair,
             mtu_discovery_config,
+            // Consumed by `GenTransport::new`, not relevant to the quinn config.
+            socket_config: _,
         } = config;
         let mut transport = quinn::TransportConfig::default();
         // Disable uni-directional streams.

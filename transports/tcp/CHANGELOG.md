@@ -1,5 +1,9 @@
 ## 0.44.0
 
+- Add `Config::with_socket_config` to run a caller-supplied hook against every socket
+  (listeners and dialers) before it is bound or connected, e.g. to set `SO_MARK` for
+  firewall/fwmark classification. Re-export the `socket2` crate.
+
 - Remove `async-std` support.
   See [PR 5955](https://github.com/libp2p/rust-libp2p/pull/5955)
 

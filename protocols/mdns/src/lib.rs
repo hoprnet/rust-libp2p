@@ -35,7 +35,9 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 use std::{
+    fmt, io,
     net::{Ipv4Addr, Ipv6Addr},
+    sync::Arc,
     time::Duration,
 };
 
@@ -43,6 +45,7 @@ mod behaviour;
 #[cfg(feature = "tokio")]
 pub use crate::behaviour::tokio;
 pub use crate::behaviour::{Behaviour, Event};
+pub use socket2;
 
 /// The DNS service name for all libp2p peers used to query for addresses.
 const SERVICE_NAME: &[u8] = b"_p2p._udp.local";
@@ -55,6 +58,23 @@ const META_QUERY_SERVICE_FQDN: &str = "_services._dns-sd._udp.local.";
 
 pub const IPV4_MDNS_MULTICAST_ADDRESS: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 pub const IPV6_MDNS_MULTICAST_ADDRESS: Ipv6Addr = Ipv6Addr::new(0xFF02, 0, 0, 0, 0, 0, 0, 0xFB);
+
+/// Callback applied to every UDP socket the mDNS behaviour creates, allowing the caller to
+/// set arbitrary socket options (e.g. `SO_MARK`) before the socket is bound.
+pub(crate) type SocketConfigFn = Arc<dyn Fn(&socket2::Socket) -> io::Result<()> + Send + Sync>;
+
+/// Wrapper around a [`SocketConfigFn`] so that [`Config`] keeps deriving [`Clone`] and
+/// [`Debug`].
+///
+/// This type is opaque; construct it via [`Config::with_socket_config`].
+#[derive(Clone)]
+pub struct SocketConfig(pub(crate) SocketConfigFn);
+
+impl fmt::Debug for SocketConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SocketConfig(<fn>)")
+    }
+}
 
 /// Configuration for mDNS.
 #[derive(Debug, Clone)]
@@ -69,6 +89,10 @@ pub struct Config {
     pub query_interval: Duration,
     /// Use IPv6 instead of IPv4.
     pub enable_ipv6: bool,
+    /// Optional callback to customise UDP sockets before they are bound.
+    ///
+    /// This field is opaque; set it via [`Config::with_socket_config`].
+    pub socket_config: Option<SocketConfig>,
 }
 
 impl Default for Config {
@@ -77,6 +101,34 @@ impl Default for Config {
             ttl: Duration::from_secs(6 * 60),
             query_interval: Duration::from_secs(5 * 60),
             enable_ipv6: false,
+            socket_config: None,
         }
+    }
+}
+
+impl Config {
+    /// Registers a callback that is run against every UDP socket the mDNS behaviour
+    /// creates, *before* the socket is bound.
+    ///
+    /// This grants access to the underlying [`socket2::Socket`] so that arbitrary socket
+    /// options can be set. Returning an error aborts creation of that socket.
+    ///
+    /// A common use is tagging sockets with `SO_MARK` so that firewall rules can classify
+    /// or filter libp2p traffic via fwmark:
+    ///
+    /// ```no_run
+    /// # use libp2p_mdns::Config;
+    /// let config = Config::default().with_socket_config(|socket| {
+    ///     #[cfg(target_os = "linux")]
+    ///     socket.set_mark(0x1234)?;
+    ///     Ok(())
+    /// });
+    /// ```
+    pub fn with_socket_config(
+        mut self,
+        f: impl Fn(&socket2::Socket) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.socket_config = Some(SocketConfig(Arc::new(f)));
+        self
     }
 }
