@@ -1,3 +1,11 @@
+## 0.15.0
+
+- Add `Config::with_congestion_controller_factory` to plug a custom
+  `quinn::congestion::ControllerFactory` into the transport, and add a BBRv2
+  congestion controller ported from
+  [Cloudflare quiche](https://github.com/cloudflare/quiche/tree/master/quiche/src/recovery/gcongestion),
+  selectable with `Config::with_bbr2`.
+
 ## 0.14.0
 
 - Prefer and advertise the X25519MLKEM768 key exchange group for QUIC.
