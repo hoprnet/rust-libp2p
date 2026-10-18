@@ -71,6 +71,13 @@ pub struct Config {
 
     /// Parameters governing MTU discovery. See [`MtuDiscoveryConfig`] for details.
     mtu_discovery_config: Option<MtuDiscoveryConfig>,
+
+    /// Congestion controller factory for the inner [`quinn::TransportConfig`].
+    ///
+    /// Defaults to Quinn's own default (CUBIC). Use
+    /// [`Config::with_congestion_controller_factory`] or
+    /// [`Config::with_bbr2`] to change it.
+    congestion_controller_factory: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>,
 }
 
 #[expect(deprecated)]
@@ -98,7 +105,39 @@ impl Config {
             max_stream_data: 10_000_000,
             keypair: keypair.clone(),
             mtu_discovery_config: Some(Default::default()),
+            congestion_controller_factory: Arc::new(quinn::congestion::CubicConfig::default()),
         }
+    }
+
+    /// Set the congestion controller factory used for every connection of this
+    /// transport.
+    ///
+    /// This is the general escape hatch: any [`quinn::congestion::ControllerFactory`],
+    /// such as Quinn's bundled `CubicConfig`, `NewRenoConfig` or `BbrConfig`, can
+    /// be plugged in. To use the BBRv2 implementation shipped with this crate,
+    /// prefer [`Config::with_bbr2`] or [`Config::with_bbr2_params`].
+    pub fn with_congestion_controller_factory(
+        mut self,
+        factory: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>,
+    ) -> Self {
+        self.congestion_controller_factory = factory;
+        self
+    }
+
+    /// Use BBRv2 congestion control with default parameters.
+    ///
+    /// See [`crate::bbr2`] for details.
+    pub fn with_bbr2(self) -> Self {
+        self.with_bbr2_params(crate::bbr2::Bbr2Params::default())
+    }
+
+    /// Use BBRv2 congestion control with the given parameters.
+    ///
+    /// See [`crate::bbr2`] for details.
+    pub fn with_bbr2_params(self, params: crate::bbr2::Bbr2Params) -> Self {
+        self.with_congestion_controller_factory(Arc::new(crate::bbr2::Bbr2Config::from_params(
+            params,
+        )))
     }
 
     /// Set the upper bound to the max UDP payload size that MTU discovery will search for.
@@ -139,8 +178,10 @@ impl From<Config> for QuinnConfig {
             handshake_timeout: _,
             keypair,
             mtu_discovery_config,
+            congestion_controller_factory,
         } = config;
         let mut transport = quinn::TransportConfig::default();
+        transport.congestion_controller_factory(congestion_controller_factory);
         // Disable uni-directional streams.
         transport.max_concurrent_uni_streams(0u32.into());
         transport.max_concurrent_bidi_streams(max_concurrent_stream_limit.into());
