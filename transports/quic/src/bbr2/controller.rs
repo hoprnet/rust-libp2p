@@ -92,8 +92,8 @@ impl Bbr2 {
 
     /// Returns the BBRv2 model's computed pacing rate.
     ///
-    /// Note that `quinn-proto 0.11` drives pacing internally from the
-    /// congestion window and smoothed RTT.
+    /// Quinn paces transmissions at this rate through
+    /// [`Controller::pacing_rate`].
     pub fn pacing_rate(&self) -> Bandwidth {
         self.core.pacing_rate()
     }
@@ -438,6 +438,10 @@ impl Controller for Bbr2 {
         self.core.get_congestion_window() as u64
     }
 
+    fn pacing_rate(&self) -> Option<u64> {
+        Some(self.core.pacing_rate().to_bytes_per_second())
+    }
+
     fn clone_box(&self) -> Box<dyn Controller> {
         Box::new(self.clone())
     }
@@ -551,6 +555,17 @@ mod tests {
 
         assert_eq!(controller.clone_box().window(), window);
         assert!(controller.into_any().downcast::<Bbr2>().is_ok());
+    }
+
+    #[test]
+    fn controller_paces_at_the_bbr2_pacing_rate() {
+        let params = Bbr2Params {
+            initial_pacing_rate_bytes_per_second: Some(2_000_000),
+            ..Default::default()
+        };
+        let controller = Arc::new(Bbr2Config::from_params(params)).build(Instant::now(), MTU);
+
+        assert_eq!(controller.pacing_rate(), Some(2_000_000));
     }
 
     #[test]

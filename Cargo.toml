@@ -152,6 +152,7 @@ hashlink = "0.9.0"
 # we import via `rust-multiaddr`.
 # This is expected to stay here until we move `libp2p-identity` to a separate repository which makes the dependency relationship more obvious.
 libp2p-identity = { path = "identity" }
+quinn-proto = { git = "https://github.com/hoprnet/quinn", rev = "231029ed600b064c7f5ef5ffef6699c0666a30f4" }
 
 [workspace.lints]
 rust.unreachable_pub = "warn"
