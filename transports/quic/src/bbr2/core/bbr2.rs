@@ -67,6 +67,10 @@ impl From<BbrBwLoReductionStrategy> for BwLoMode {
 }
 
 /// Customizable parameters for BBRv2.
+///
+/// Every field is optional: `None` (the default) selects the algorithm's
+/// built-in value for that parameter, so `Bbr2Params::default()` matches
+/// the upstream defaults.
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
 pub struct Bbr2Params {
     pub startup_cwnd_gain: Option<f32>,
@@ -505,6 +509,18 @@ impl BBRv2 {
         self.mode
             .network_model_mut()
             .on_packet_neutered(packet_number);
+    }
+
+    pub fn on_packet_partially_neutered(&mut self, packet_number: u64, bytes: usize) {
+        self.mode
+            .network_model_mut()
+            .on_packet_partially_neutered(packet_number, bytes);
+    }
+
+    pub fn record_partial_ack(&mut self, packet_number: u64, bytes: usize) {
+        self.mode
+            .network_model_mut()
+            .record_partial_ack(packet_number, bytes);
     }
 
     pub fn on_app_limited(&mut self) {

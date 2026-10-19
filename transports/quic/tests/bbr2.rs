@@ -5,7 +5,7 @@
 //! These drive real QUIC connections, so they cover what the unit tests of
 //! [`libp2p_quic::bbr2`] cannot: that Quinn accepts the [`ControllerFactory`] we
 //! hand it and that connections keep working with BBRv2 in charge of the
-//! congestion window and pacing rate.
+//! congestion window.
 
 use std::{
     sync::{

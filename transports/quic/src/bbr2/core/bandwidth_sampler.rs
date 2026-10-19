@@ -89,6 +89,13 @@ impl<T> ConnectionStateMap<T> {
         ret
     }
 
+    pub(crate) fn get_mut(&mut self, pkt_num: u64) -> Option<&mut T> {
+        match self.packet_map.binary_search_by_key(&pkt_num, |&(n, _)| n) {
+            Ok(found) => self.packet_map.get_mut(found).and_then(|(_, v)| v.as_mut()),
+            Err(_) => None,
+        }
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn peek(&self, pkt_num: u64) -> Option<&T> {
@@ -109,6 +116,24 @@ impl<T> ConnectionStateMap<T> {
     }
 }
 
+impl ConnectionStateMap<ConnectionStateOnSentPacket> {
+    pub(crate) fn take_partial(
+        &mut self,
+        pkt_num: u64,
+        bytes: usize,
+    ) -> Option<ConnectionStateOnSentPacket> {
+        let entry = self.get_mut(pkt_num)?;
+        if entry.size > bytes {
+            entry.size -= bytes;
+            let mut ret = entry.clone();
+            ret.size = bytes;
+            Some(ret)
+        } else {
+            self.take(pkt_num)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectionStateOnSentPacket {
     pub sent_time: Instant,
@@ -117,6 +142,7 @@ pub(crate) struct ConnectionStateOnSentPacket {
     pub last_acked_packet_sent_time: Instant,
     pub last_acked_packet_ack_time: Instant,
     pub send_time_state: SendTimeState,
+    pub partial_ack_size: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -313,7 +339,7 @@ impl MaxAckHeightTracker {
             extra_acked: extra_bytes_acked,
             bytes_acked: self.aggregation_epoch_bytes,
             time_delta: aggregation_delta,
-            round: 0,
+            round: round_trip_count,
         };
 
         self.max_ack_height_filter
@@ -439,6 +465,7 @@ impl BandwidthSampler {
                 total_bytes_lost: self.total_bytes_lost,
                 bytes_in_flight: bytes_in_flight + bytes,
             },
+            partial_ack_size: None,
         };
 
         self.connection_state_map
@@ -447,6 +474,12 @@ impl BandwidthSampler {
 
     pub fn on_packet_neutered(&mut self, packet_number: u64) {
         if let Some(pkt) = self.connection_state_map.take(packet_number) {
+            self.total_bytes_neutered += pkt.size;
+        }
+    }
+
+    pub fn on_packet_partially_neutered(&mut self, packet_number: u64, bytes: usize) {
+        if let Some(pkt) = self.connection_state_map.take_partial(packet_number, bytes) {
             self.total_bytes_neutered += pkt.size;
         }
     }
@@ -551,7 +584,10 @@ impl BandwidthSampler {
         let mut send_time_state = SendTimeState::default();
 
         self.total_bytes_lost += bytes_lost;
-        if let Some(state) = self.connection_state_map.take(packet_number) {
+        if let Some(state) = self
+            .connection_state_map
+            .take_partial(packet_number, bytes_lost)
+        {
             send_time_state = state.send_time_state;
             send_time_state.is_valid = true;
         }
@@ -601,7 +637,17 @@ impl BandwidthSampler {
         packet_number: u64,
     ) -> Option<BandwidthSample> {
         self.last_acked_packet = packet_number;
-        let sent_packet = self.connection_state_map.take(packet_number)?;
+        let partial_ack_size = self
+            .connection_state_map
+            .get_mut(packet_number)
+            .and_then(|e| e.partial_ack_size.take());
+
+        let sent_packet = match partial_ack_size {
+            Some(bytes) => self
+                .connection_state_map
+                .take_partial(packet_number, bytes)?,
+            None => self.connection_state_map.take(packet_number)?,
+        };
 
         self.total_bytes_acked += sent_packet.size;
         self.total_bytes_sent_at_last_acked_packet = sent_packet.send_time_state.total_bytes_sent;
@@ -720,7 +766,59 @@ impl BandwidthSampler {
         self.end_of_app_limited_phase = Some(self.last_sent_packet);
     }
 
+    pub fn record_partial_ack(&mut self, pkt_num: u64, bytes: usize) {
+        if let Some(entry) = self.connection_state_map.get_mut(pkt_num) {
+            entry.partial_ack_size = Some(bytes);
+        }
+    }
+
     pub fn remove_obsolete_packets(&mut self, least_acked: u64) {
         self.connection_state_map.remove_obsolete(least_acked);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_ack_height_tracker_preserves_round_on_max_bandwidth_increase() {
+        let mut tracker = MaxAckHeightTracker::new(10, false);
+        let mut now = Instant::now();
+        let bw = Bandwidth::from_bytes_per_second(100_000);
+
+        // Epoch start in round 5
+        tracker.update(bw, false, 5, 10, 1, now, 1000);
+        now += Duration::from_millis(1);
+        // Epoch end with large extra acked in round 5
+        let extra = tracker.update(bw, false, 5, 10, 2, now, 20_000);
+        assert!(extra > 0);
+        assert!(
+            tracker
+                .max_ack_height_filter
+                .get_best()
+                .unwrap()
+                .extra_acked
+                > 0
+        );
+
+        // Advance to round 12 (7 rounds later <= 10 window length).
+        // Trigger is_new_max_bandwidth = true.
+        now += Duration::from_millis(50);
+        let higher_bw = Bandwidth::from_bytes_per_second(101_000);
+        tracker.update(higher_bw, true, 12, 20, 11, now, 1000);
+
+        // The reinserted best sample must still be valid in round 12 because 12 - 5 <= 10.
+        now += Duration::from_millis(5);
+        tracker.update(higher_bw, false, 12, 20, 12, now, 100);
+
+        let best = tracker
+            .max_ack_height_filter
+            .get_best()
+            .expect("best sample should exist");
+        assert!(
+            best.extra_acked > 10_000,
+            "best sample should not have expired prematurely"
+        );
     }
 }

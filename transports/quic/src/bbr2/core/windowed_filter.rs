@@ -40,7 +40,7 @@ struct Sample<T, I> {
 }
 
 #[derive(Debug, Clone)]
-pub struct WindowedFilter<T, I, D> {
+pub(crate) struct WindowedFilter<T, I, D> {
     window_length: D,
     estimates: [Option<Sample<T, I>>; 3],
 }
@@ -51,14 +51,14 @@ where
     I: Sub<I, Output = D> + Copy,
     D: Ord + Div<usize, Output = D> + Copy,
 {
-    pub fn new(window_length: D) -> Self {
+    pub(crate) fn new(window_length: D) -> Self {
         WindowedFilter {
             window_length,
             estimates: [None, None, None],
         }
     }
 
-    pub fn reset(&mut self, new_sample: T, new_time: I) {
+    pub(crate) fn reset(&mut self, new_sample: T, new_time: I) {
         let sample = Some(Sample {
             sample: new_sample,
             time: new_time,
@@ -67,23 +67,23 @@ where
         self.estimates = [sample, sample, sample];
     }
 
-    pub fn get_best(&self) -> Option<T> {
+    pub(crate) fn get_best(&self) -> Option<T> {
         self.estimates[0].as_ref().map(|e| e.sample)
     }
 
-    pub fn get_second_best(&self) -> Option<T> {
+    pub(crate) fn get_second_best(&self) -> Option<T> {
         self.estimates[1].as_ref().map(|e| e.sample)
     }
 
-    pub fn get_third_best(&self) -> Option<T> {
+    pub(crate) fn get_third_best(&self) -> Option<T> {
         self.estimates[2].as_ref().map(|e| e.sample)
     }
 
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.estimates = [None, None, None];
     }
 
-    pub fn update(&mut self, new_sample: T, new_time: I) {
+    pub(crate) fn update(&mut self, new_sample: T, new_time: I) {
         if match &self.estimates[0] {
             None => true,
             Some(best) if new_sample > best.sample => true,

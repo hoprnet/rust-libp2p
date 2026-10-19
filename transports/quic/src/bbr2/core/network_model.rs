@@ -39,7 +39,7 @@ use super::{
     bbr2::{BBRv2CongestionEvent, BwLoMode, Params},
 };
 
-pub const DEFAULT_MSS: usize = 1300;
+pub(crate) const DEFAULT_MSS: usize = 1300;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RoundTripCounter {
@@ -382,6 +382,16 @@ impl BBRv2NetworkModel {
 
     pub(crate) fn on_packet_neutered(&mut self, packet_number: u64) {
         self.bandwidth_sampler.on_packet_neutered(packet_number);
+    }
+
+    pub(crate) fn on_packet_partially_neutered(&mut self, packet_number: u64, bytes: usize) {
+        self.bandwidth_sampler
+            .on_packet_partially_neutered(packet_number, bytes);
+    }
+
+    pub(crate) fn record_partial_ack(&mut self, packet_number: u64, bytes: usize) {
+        self.bandwidth_sampler
+            .record_partial_ack(packet_number, bytes);
     }
 
     fn adapt_lower_bounds(&mut self, congestion_event: &BBRv2CongestionEvent, params: &Params) {

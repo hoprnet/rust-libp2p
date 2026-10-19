@@ -90,7 +90,10 @@ impl Bbr2 {
         &mut self.core
     }
 
-    /// Returns the current pacing rate.
+    /// Returns the BBRv2 model's computed pacing rate.
+    ///
+    /// Note that `quinn-proto 0.11` drives pacing internally from the
+    /// congestion window and smoothed RTT.
     pub fn pacing_rate(&self) -> Bandwidth {
         self.core.pacing_rate()
     }
@@ -119,7 +122,7 @@ impl Bbr2 {
         bytes: usize,
         is_retransmissible: bool,
     ) {
-        self.bytes_in_flight = bytes_in_flight;
+        self.bytes_in_flight = bytes_in_flight + bytes;
         self.core.on_packet_sent(
             sent_time,
             bytes_in_flight,
@@ -147,21 +150,34 @@ impl Bbr2 {
 
 impl Controller for Bbr2 {
     fn on_sent(&mut self, now: Instant, bytes: u64, _last_packet_number: u64) {
-        let size = bytes as usize;
-        self.bytes_in_flight += size;
-        let packet_number = self.next_packet_number;
-        self.next_packet_number += 1;
+        let total_size = bytes as usize;
+        if total_size == 0 {
+            return;
+        }
 
-        self.sent_packets.push_back(SentPacketRecord {
-            packet_number,
-            sent_time: now,
-            size,
-            acked: false,
-            lost: false,
-        });
+        let mss = (self.current_mtu as usize).max(BASE_DATAGRAM_SIZE as usize);
+        let mut remaining = total_size;
 
-        self.core
-            .on_packet_sent(now, self.bytes_in_flight, packet_number, size, true);
+        while remaining > 0 {
+            let chunk_size = remaining.min(mss);
+            let prior_in_flight = self.bytes_in_flight;
+            self.bytes_in_flight += chunk_size;
+            let packet_number = self.next_packet_number;
+            self.next_packet_number += 1;
+
+            self.sent_packets.push_back(SentPacketRecord {
+                packet_number,
+                sent_time: now,
+                size: chunk_size,
+                acked: false,
+                lost: false,
+            });
+
+            self.core
+                .on_packet_sent(now, prior_in_flight, packet_number, chunk_size, true);
+
+            remaining -= chunk_size;
+        }
     }
 
     fn on_ack(
@@ -177,6 +193,10 @@ impl Controller for Bbr2 {
         }
 
         let size = bytes as usize;
+        if size == 0 {
+            return;
+        }
+
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(size);
         self.pending_acked_bytes += size;
 
@@ -190,11 +210,27 @@ impl Controller for Bbr2 {
         }
 
         if matched_packet.is_none() {
+            let mut remaining = size;
             for record in &mut self.sent_packets {
                 if !record.acked && !record.lost && record.sent_time == sent {
-                    record.acked = true;
-                    matched_packet = Some(record.packet_number);
-                    break;
+                    if record.size <= remaining {
+                        record.acked = true;
+                        remaining -= record.size;
+                        if matched_packet.is_none() {
+                            matched_packet = Some(record.packet_number);
+                        }
+                        if remaining == 0 {
+                            break;
+                        }
+                    } else {
+                        record.size -= remaining;
+                        self.core
+                            .record_partial_ack(record.packet_number, remaining);
+                        if matched_packet.is_none() {
+                            matched_packet = Some(record.packet_number);
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -219,6 +255,35 @@ impl Controller for Bbr2 {
             self.core.on_app_limited();
         }
 
+        // Reconcile silently discarded packets (e.g. Initial/Handshake keys discarded by Quinn)
+        let tracked_in_flight: usize = self
+            .sent_packets
+            .iter()
+            .filter(|r| !r.acked && !r.lost)
+            .map(|r| r.size)
+            .sum();
+
+        let mut excess = tracked_in_flight.saturating_sub(self.bytes_in_flight);
+        if excess > 0 {
+            for record in &mut self.sent_packets {
+                if !record.acked && !record.lost {
+                    if record.size <= excess {
+                        record.acked = true;
+                        excess -= record.size;
+                        self.core.on_packet_neutered(record.packet_number);
+                        if excess == 0 {
+                            break;
+                        }
+                    } else {
+                        record.size -= excess;
+                        self.core
+                            .on_packet_partially_neutered(record.packet_number, excess);
+                        break;
+                    }
+                }
+            }
+        }
+
         while let Some(front) = self.sent_packets.front() {
             if front.acked || front.lost {
                 self.least_unacked_packet = front.packet_number + 1;
@@ -227,6 +292,9 @@ impl Controller for Bbr2 {
                 self.least_unacked_packet = front.packet_number;
                 break;
             }
+        }
+        if self.sent_packets.is_empty() {
+            self.least_unacked_packet = self.next_packet_number;
         }
 
         if !self.pending_acks.is_empty() || !self.pending_losses.is_empty() {
@@ -253,7 +321,7 @@ impl Controller for Bbr2 {
 
     fn on_congestion_event(
         &mut self,
-        _now: Instant,
+        now: Instant,
         sent: Instant,
         _is_persistent_congestion: bool,
         lost_bytes: u64,
@@ -265,20 +333,100 @@ impl Controller for Bbr2 {
         let size = lost_bytes as usize;
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(size);
 
-        let mut matched_packet = None;
-        for record in &mut self.sent_packets {
+        // Quinn reports aggregate lost bytes across all lost packets in the batch,
+        // and `sent` is the send time of the largest/newest lost packet in that batch.
+        // Earlier lost packets have `sent_time <= sent`.
+        let mut remaining = size;
+        let mut any_matched = false;
+
+        for record in self.sent_packets.iter_mut().rev() {
             if !record.acked && !record.lost && record.sent_time == sent {
-                record.lost = true;
-                matched_packet = Some(record.packet_number);
-                break;
+                if record.size <= remaining {
+                    record.lost = true;
+                    remaining -= record.size;
+                    self.pending_losses.push(Lost {
+                        packet_number: record.packet_number,
+                        bytes_lost: record.size,
+                    });
+                    any_matched = true;
+                    if remaining == 0 {
+                        break;
+                    }
+                } else {
+                    record.size -= remaining;
+                    self.pending_losses.push(Lost {
+                        packet_number: record.packet_number,
+                        bytes_lost: remaining,
+                    });
+                    remaining = 0;
+                    any_matched = true;
+                    break;
+                }
             }
         }
 
-        let packet_number = matched_packet.unwrap_or(self.least_unacked_packet);
-        self.pending_losses.push(Lost {
-            packet_number,
-            bytes_lost: size,
-        });
+        if remaining > 0 {
+            for record in self.sent_packets.iter_mut().rev() {
+                if !record.acked && !record.lost && record.sent_time < sent {
+                    if record.size <= remaining {
+                        record.lost = true;
+                        remaining -= record.size;
+                        self.pending_losses.push(Lost {
+                            packet_number: record.packet_number,
+                            bytes_lost: record.size,
+                        });
+                        any_matched = true;
+                        if remaining == 0 {
+                            break;
+                        }
+                    } else {
+                        record.size -= remaining;
+                        self.pending_losses.push(Lost {
+                            packet_number: record.packet_number,
+                            bytes_lost: remaining,
+                        });
+                        any_matched = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !any_matched {
+            self.pending_losses.push(Lost {
+                packet_number: self.least_unacked_packet,
+                bytes_lost: size,
+            });
+        }
+
+        while let Some(front) = self.sent_packets.front() {
+            if front.acked || front.lost {
+                self.least_unacked_packet = front.packet_number + 1;
+                self.sent_packets.pop_front();
+            } else {
+                self.least_unacked_packet = front.packet_number;
+                break;
+            }
+        }
+        if self.sent_packets.is_empty() {
+            self.least_unacked_packet = self.next_packet_number;
+        }
+
+        if self.pending_acks.is_empty() && !self.pending_losses.is_empty() {
+            self.pending_losses.sort_by_key(|l| l.packet_number);
+            let total_lost: usize = self.pending_losses.iter().map(|l| l.bytes_lost).sum();
+            let prior_in_flight = self.bytes_in_flight + total_lost;
+
+            self.core.on_congestion_event(
+                prior_in_flight,
+                now,
+                &[],
+                &self.pending_losses,
+                self.least_unacked_packet,
+            );
+
+            self.pending_losses.clear();
+        }
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
@@ -380,6 +528,11 @@ mod tests {
 
     const MTU: u16 = 1200;
 
+    fn dummy_rtt() -> Box<RttEstimator> {
+        // RttEstimator does not expose a public constructor, but is unused by Bbr2::on_ack.
+        unsafe { Box::new(std::mem::zeroed::<RttEstimator>()) }
+    }
+
     #[test]
     fn factory_builds_a_controller_with_the_configured_initial_window() {
         let mut config = Bbr2Config::default();
@@ -451,5 +604,131 @@ mod tests {
         controller.on_mtu_update(1400);
 
         assert_eq!(controller.window(), window_before * 1400 / MTU as u64);
+    }
+
+    #[test]
+    fn pre_send_in_flight_exits_quiescence_on_new_send() {
+        let now = Instant::now();
+        let mut controller = Bbr2::new(Arc::new(Bbr2Config::default()), now, MTU);
+        let rtt = dummy_rtt();
+
+        // Send 1 packet
+        controller.on_sent(now, MTU as u64, 1);
+        // Ack 1 packet with 0 in-flight -> enters quiescence
+        controller.on_ack(
+            now + Duration::from_millis(50),
+            now,
+            MTU as u64,
+            false,
+            &rtt,
+        );
+        controller.on_end_acks(now + Duration::from_millis(50), 0, false, Some(1));
+
+        // Should be in quiescence (is_in_recovery is false when in quiescence)
+        assert!(!controller.core().is_in_recovery());
+
+        // Send new packet after idling
+        let later = now + Duration::from_secs(1);
+        controller.on_sent(later, MTU as u64, 2);
+
+        // Should exit quiescence (is_in_recovery becomes true)
+        assert!(controller.core().is_in_recovery());
+    }
+
+    #[test]
+    fn batched_gso_send_accounting() {
+        let now = Instant::now();
+        let mut controller = Bbr2::new(Arc::new(Bbr2Config::default()), now, MTU);
+        let rtt = dummy_rtt();
+
+        // GSO batch of 2400 bytes (2 * MTU)
+        controller.on_sent(now, 2 * MTU as u64, 2);
+
+        // 50ms later, only 1200 bytes is ACKed
+        controller.on_ack(
+            now + Duration::from_millis(50),
+            now,
+            MTU as u64,
+            false,
+            &rtt,
+        );
+        controller.on_end_acks(now + Duration::from_millis(50), MTU as u64, false, Some(1));
+
+        // Window must grow by at most the acked bytes (1200), NOT by the full 2400 batch!
+        let window_after_first_ack = controller.window();
+        assert_eq!(window_after_first_ack, 10 * MTU as u64 + MTU as u64);
+        assert_eq!(controller.sent_packets.len(), 1);
+
+        // Ack the second 1200 bytes
+        controller.on_ack(
+            now + Duration::from_millis(50),
+            now,
+            MTU as u64,
+            false,
+            &rtt,
+        );
+        controller.on_end_acks(now + Duration::from_millis(50), 0, false, Some(2));
+
+        assert_eq!(controller.window(), 10 * MTU as u64 + 2 * MTU as u64);
+        assert_eq!(controller.sent_packets.len(), 0);
+    }
+
+    #[test]
+    fn retire_all_packets_in_loss_batch() {
+        let now = Instant::now();
+        let mut controller = Bbr2::new(Arc::new(Bbr2Config::default()), now, MTU);
+
+        // Send 3 separate packets at distinct timestamps
+        let t1 = now;
+        controller.on_sent(t1, MTU as u64, 1);
+        let t2 = now + Duration::from_millis(10);
+        controller.on_sent(t2, MTU as u64, 2);
+        let t3 = now + Duration::from_millis(20);
+        controller.on_sent(t3, MTU as u64, 3);
+
+        assert_eq!(controller.sent_packets.len(), 3);
+
+        // Quinn reports 3600-byte loss batch with the newest packet's timestamp (t3)
+        controller.on_congestion_event(now + Duration::from_millis(50), t3, false, 3 * MTU as u64);
+        controller.on_end_acks(now + Duration::from_millis(50), 0, false, None);
+
+        // All 3 packets must be retired!
+        assert!(
+            controller.sent_packets.is_empty(),
+            "sent_packets should be empty after all are lost"
+        );
+        assert_eq!(controller.least_unacked_packet, 4);
+    }
+
+    #[test]
+    fn clean_up_discarded_handshake_packets() {
+        let now = Instant::now();
+        let mut controller = Bbr2::new(Arc::new(Bbr2Config::default()), now, MTU);
+        let rtt = dummy_rtt();
+
+        // Initial space packets sent during handshake
+        let t1 = now;
+        controller.on_sent(t1, MTU as u64, 1);
+        controller.on_sent(t1, MTU as u64, 2);
+
+        // Data space packets sent
+        let t2 = now + Duration::from_millis(10);
+        controller.on_sent(t2, MTU as u64, 3);
+        controller.on_sent(t2, MTU as u64, 4);
+
+        assert_eq!(controller.sent_packets.len(), 4);
+
+        // Handshake keys dropped by Quinn -> Initial packets discarded without on_ack/on_loss.
+        // Data packets ACKed. in_flight drops to 0.
+        controller.on_ack(now + Duration::from_millis(50), t2, MTU as u64, false, &rtt);
+        controller.on_ack(now + Duration::from_millis(50), t2, MTU as u64, false, &rtt);
+        controller.on_end_acks(now + Duration::from_millis(50), 0, false, Some(4));
+
+        // The discarded Initial packets must NOT remain in sent_packets!
+        assert!(
+            controller.sent_packets.is_empty(),
+            "sent_packets must not leak discarded Initial packets"
+        );
+        assert_eq!(controller.least_unacked_packet, 5);
     }
 }

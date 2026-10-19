@@ -8,9 +8,9 @@
 //! as the default CUBIC on paths with a high bandwidth-delay product or with
 //! shallow buffers, while keeping the queueing delay in check. It is opt-in: see
 //! [`Config::with_bbr2`](crate::Config::with_bbr2) and
-//! [`Config::with_bbr2_params`](crate::Config::with_bbr2_params). A QUIC
-//! connection upgrades to BBRv2 only if both peers run this build; otherwise
-//! both ends fall back to the controller they were configured with.
+//! [`Config::with_bbr2_params`](crate::Config::with_bbr2_params). Congestion
+//! control is sender-side only: each endpoint applies the controller it is
+//! configured with, independently of the remote peer.
 //!
 //! The implementation is split into two layers:
 //!
