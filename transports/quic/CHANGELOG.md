@@ -1,4 +1,13 @@
+## 0.13.2
+
+- Add `Config::with_congestion_controller_factory` to plug a custom
+  `quinn::congestion::ControllerFactory` into the transport, and add a BBRv2
+  congestion controller ported from
+  [Cloudflare quiche](https://github.com/cloudflare/quiche/tree/master/quiche/src/recovery/gcongestion),
+  selectable with `Config::with_bbr2`.
+
 ## 0.13.1
+
 - Handle certificate validation failures in post-handshake upgrade path instead of panicking.
   See [GHSA-5hq8-qhww-jm7q](https://github.com/libp2p/rust-libp2p/security/advisories/GHSA-5hq8-qhww-jm7q)
 

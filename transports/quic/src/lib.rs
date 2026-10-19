@@ -60,6 +60,8 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+pub mod bbr2;
+
 mod config;
 mod connection;
 mod hole_punching;
