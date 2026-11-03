@@ -9,21 +9,21 @@ repository = "https://github.com/libp2p/rust-libp2p"
 license = "MIT"
 
 [dependencies]
-futures = { workspace = true }
+futures = { version = "0.3.30", default-features = false }
 futures-timer = "3.0.3"
-if-watch = { workspace = true }
-libp2p-core = { workspace = true }
-libp2p-tls = { workspace = true }
-libp2p-identity = { workspace = true }
+if-watch = { version = "3.2.1", default-features = false }
+libp2p-core = { version = "0.43.1", default-features = false }
+libp2p-tls = { version = "0.6.2", default-features = false }
+libp2p-identity = { version = "0.2.12", default-features = false }
 quinn = { version = "0.11.6", default-features = false, features = ["rustls", "futures-io"] }
 quinn-proto = { version = "0.11" }
 rand = "0.8.5"
 rustls = { version = "0.23.9", default-features = false }
-thiserror = { workspace = true }
-tokio = { workspace = true, default-features = false, features = ["net", "rt", "time"], optional = true }
-tracing = { workspace = true }
+thiserror = { version = "2" }
+tokio = { version = "1.38", default-features = false, features = ["net", "rt", "time"], optional = true }
+tracing = { version = "0.1.41" }
 socket2 = "0.5.7"
-ring = { workspace = true }
+ring = { version = "0.17.12" }
 
 [features]
 tokio = ["dep:tokio", "if-watch/tokio", "quinn/runtime-tokio"]
@@ -34,18 +34,26 @@ tokio = ["dep:tokio", "if-watch/tokio", "quinn/runtime-tokio"]
 all-features = true
 
 [dev-dependencies]
-libp2p-identity = { workspace = true, features = ["rand"] }
+libp2p-identity = { version = "0.2.12", features = ["rand"] }
 libp2p-muxer-test-harness = { path = "../../muxers/test-harness" }
-libp2p-noise = { workspace = true }
-libp2p-tcp = { workspace = true, features = ["tokio"] }
-libp2p-yamux = { workspace = true }
+libp2p-noise = { version = "0.46.1" }
+libp2p-tcp = { version = "0.44.0", features = ["tokio"] }
+libp2p-yamux = { version = "0.47.0" }
 quickcheck = "1"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "time"] }
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
 [[test]]
 name = "stream_compliance"
 required-features = ["tokio"]
 
 [lints]
-workspace = true
+# Kept in step with the workspace table this crate is developed against.
+rust.unreachable_pub = "warn"
+clippy.dbgs_macro = "warn"
+clippy.manual_let_else = "warn"
+clippy.type_complexity = "allow"
+clippy.unnecessary_wraps = "warn"
+clippy.used_underscore_binding = "warn"
+clippy.pedantic.level = "allow"
+clippy.pedantic.priority = -1
