@@ -74,15 +74,85 @@ pub struct Config {
 
     /// Congestion controller factory for the inner [`quinn::TransportConfig`].
     ///
-    /// Defaults to Quinn's own default (CUBIC). Use
-    /// [`Config::with_congestion_controller_factory`] or
-    /// [`Config::with_bbr2`] to change it.
+    /// [`Config::new`] defaults it to the controller named by
+    /// [`CONGESTION_CONTROLLER_ENV`], which is Quinn's own default (CUBIC) when
+    /// that variable is unset. Use [`Config::with_congestion_controller_factory`]
+    /// or [`Config::with_bbr2`] to change it.
     congestion_controller_factory: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>,
+}
+
+/// Environment variable that selects the congestion controller for [`Config::new`].
+///
+/// Accepted values, case-insensitive: `cubic` (the default when the variable is
+/// unset), `newreno`, `bbr` (Quinn's own BBRv1) and `bbr2` (this crate's
+/// [`bbr2`](crate::bbr2) controller, with default parameters). Any other value
+/// is reported and ignored.
+///
+/// This is a HOPR addition to the backport: it lets one binary run the same
+/// stack under CUBIC and BBRv2, so a throughput experiment has a control it can
+/// compare against without rebuilding. It is the only way to reach the
+/// controller from a stack that builds its swarm through `libp2p`'s
+/// `SwarmBuilder::with_quic`, which constructs `Config::new` itself.
+pub const CONGESTION_CONTROLLER_ENV: &str = "HOPR_QUIC_CONGESTION_CONTROLLER";
+
+type ControllerFactory = Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>;
+
+/// The congestion controller factory selected by [`CONGESTION_CONTROLLER_ENV`],
+/// or Quinn's default (CUBIC) when it is unset or names no known controller.
+///
+/// The selection is logged at `INFO` on every path, the default included: a
+/// throughput run is only evidence about the controller it actually used, and
+/// the node log is where that is checked afterwards. Logging only the values the
+/// variable named would leave a control run that relied on the default with no
+/// record of what it ran.
+fn congestion_controller_from_env() -> ControllerFactory {
+    let value = std::env::var_os(CONGESTION_CONTROLLER_ENV);
+    let selected = value
+        .as_deref()
+        .and_then(|value| value.to_str())
+        .and_then(congestion_controller_from_str);
+    let (name, factory): (&'static str, ControllerFactory) = match (selected, value) {
+        (Some(selection), _) => selection,
+        (None, Some(value)) => {
+            tracing::warn!(
+                variable = CONGESTION_CONTROLLER_ENV,
+                value = %value.to_string_lossy(),
+                "unknown congestion controller, using CUBIC; expected one of cubic, newreno, bbr, bbr2"
+            );
+            ("cubic", Arc::new(quinn::congestion::CubicConfig::default()))
+        }
+        (None, None) => ("cubic", Arc::new(quinn::congestion::CubicConfig::default())),
+    };
+    tracing::info!(controller = name, "quic congestion controller selected");
+    factory
+}
+
+/// Parse a congestion controller name into its canonical name and factory, or
+/// `None` when it names no known controller.
+fn congestion_controller_from_str(value: &str) -> Option<(&'static str, ControllerFactory)> {
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "cubic" => ("cubic", Arc::new(quinn::congestion::CubicConfig::default())),
+        "newreno" | "new-reno" => (
+            "newreno",
+            Arc::new(quinn::congestion::NewRenoConfig::default()),
+        ),
+        "bbr" => ("bbr", Arc::new(quinn::congestion::BbrConfig::default())),
+        "bbr2" | "bbrv2" => (
+            "bbr2",
+            Arc::new(crate::bbr2::Bbr2Config::from_params(
+                crate::bbr2::Bbr2Params::default(),
+            )),
+        ),
+        _ => return None,
+    })
 }
 
 #[expect(deprecated)]
 impl Config {
     /// Creates a new configuration object with default values.
+    ///
+    /// The congestion controller is CUBIC unless
+    /// [`CONGESTION_CONTROLLER_ENV`] selects another one.
     pub fn new(keypair: &libp2p_identity::Keypair) -> Self {
         let client_tls_config = Arc::new(
             QuicClientConfig::try_from(libp2p_tls::make_client_config(keypair, None).unwrap())
@@ -105,7 +175,7 @@ impl Config {
             max_stream_data: 10_000_000,
             keypair: keypair.clone(),
             mtu_discovery_config: Some(Default::default()),
-            congestion_controller_factory: Arc::new(quinn::congestion::CubicConfig::default()),
+            congestion_controller_factory: congestion_controller_from_env(),
         }
     }
 
@@ -221,6 +291,38 @@ impl From<Config> for QuinnConfig {
             client_config,
             server_config,
             endpoint_config,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn congestion_controller_names_are_recognised() {
+        for (name, canonical) in [
+            ("cubic", "cubic"),
+            ("newreno", "newreno"),
+            ("new-reno", "newreno"),
+            ("bbr", "bbr"),
+            ("bbr2", "bbr2"),
+            ("bbrv2", "bbr2"),
+            (" BBR2 ", "bbr2"),
+        ] {
+            let (parsed, _) = congestion_controller_from_str(name)
+                .unwrap_or_else(|| panic!("expected '{name}' to name a congestion controller"));
+            assert_eq!(parsed, canonical, "{name}");
+        }
+    }
+
+    #[test]
+    fn unknown_congestion_controller_names_are_rejected() {
+        for name in ["", " ", "cubic2", "reno", "bbr3", "bbr2-"] {
+            assert!(
+                congestion_controller_from_str(name).is_none(),
+                "expected '{name}' not to name a congestion controller"
+            );
         }
     }
 }

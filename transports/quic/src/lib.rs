@@ -70,7 +70,7 @@ mod transport;
 
 use std::net::SocketAddr;
 
-pub use config::Config;
+pub use config::{Config, CONGESTION_CONTROLLER_ENV};
 pub use connection::{Connecting, Connection, Stream};
 #[cfg(feature = "tokio")]
 pub use provider::tokio;
